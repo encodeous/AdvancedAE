@@ -73,6 +73,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     public static final String NBT_SEND_DIRECTION = "sendDirection";
     public static final String NBT_DIRECTION_MAP = "directionMap";
     public static final String NBT_RETURN_INV = "returnInv";
+    public static final String NBT_FILTERED_IMPORT_PENDING = "filteredImportPending";
 
     private final AdvPatternProviderLogicHost host;
     private final IManagedGridNode mainNode;
@@ -102,17 +103,25 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     private final AdvPatternProviderTargetCache[] targetCaches = new AdvPatternProviderTargetCache[6];
 
     /**
-     * Per-execution tracking for FILTERED_IMPORT (Option A). Each entry represents one pushed
-     * pattern execution. An execution is removed only once <em>all</em> of its output types have
-     * been returned to the network, so the return-inventory filter keeps accepting every output type
-     * of an execution until the entire execution is complete – not just until the individual type is
-     * returned first.
+     * Pending output tracking for FILTERED_IMPORT. When FILTERED_IMPORT is enabled and a pattern
+     * is pushed, this map is populated with the expected outputs (key → remaining amount). It
+     * acts as both the return-inventory filter (only keys present in the map are accepted) and
+     * as a lock (the provider refuses to push new patterns while this map is non-null).
+     *
+     * <p>Because FILTERED_IMPORT locks the provider until every output is returned, there can be
+     * at most one active pattern execution at a time, so a single map is sufficient.
+     *
+     * <p>When an output is returned to the network its amount is decremented; when the amount
+     * reaches zero the key is removed. Once the map is empty the lock is cleared.
+     *
+     * <p>Null when FILTERED_IMPORT is disabled or when no execution is in progress.
      *
      * @see #onPushPatternSuccess
      * @see #onStackReturnedToNetwork
      * @see #getActiveExpectedOutputs
      */
-    private final List<PendingPatternExecution> pendingPatternExecutions = new ArrayList<>();
+    @Nullable
+    private HashMap<AEKey, Long> filteredImportPending;
 
     private YesNo redstoneState = YesNo.UNDECIDED;
 
@@ -229,6 +238,17 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         tag.put(NBT_DIRECTION_MAP, dirListTag);
 
         tag.put(NBT_RETURN_INV, this.returnInv.writeToTag(registries));
+
+        if (filteredImportPending != null) {
+            ListTag pendingTag = new ListTag();
+            for (var entry : filteredImportPending.entrySet()) {
+                CompoundTag pendingEntry = new CompoundTag();
+                pendingEntry.put("key", entry.getKey().toTagGeneric(registries));
+                pendingEntry.putLong("amount", entry.getValue());
+                pendingTag.add(pendingEntry);
+            }
+            tag.put(NBT_FILTERED_IMPORT_PENDING, pendingTag);
+        }
     }
 
     public void readFromNBT(CompoundTag tag, HolderLookup.Provider registries) {
@@ -278,6 +298,24 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         }
 
         this.returnInv.readFromTag(tag.getList(NBT_RETURN_INV, Tag.TAG_COMPOUND), registries);
+
+        if (tag.contains(NBT_FILTERED_IMPORT_PENDING)) {
+            ListTag pendingTag = tag.getList(NBT_FILTERED_IMPORT_PENDING, Tag.TAG_COMPOUND);
+            if (!pendingTag.isEmpty()) {
+                filteredImportPending = new HashMap<>();
+                for (int i = 0; i < pendingTag.size(); i++) {
+                    CompoundTag pendingEntry = pendingTag.getCompound(i);
+                    AEKey key = AEKey.fromTagGeneric(registries, pendingEntry.getCompound("key"));
+                    long amount = pendingEntry.getLong("amount");
+                    if (key != null && amount > 0) {
+                        filteredImportPending.put(key, amount);
+                    }
+                }
+                if (filteredImportPending.isEmpty()) {
+                    filteredImportPending = null;
+                }
+            }
+        }
     }
 
     public IConfigManager getConfigManager() {
@@ -372,6 +410,12 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         var advPattern = patternDetails instanceof IAdvPatternDetails;
 
         if (getCraftingLockedReason() != LockCraftingMode.NONE) {
+            return false;
+        }
+
+        // FILTERED_IMPORT lock: block new patterns while a previous execution's outputs are
+        // still pending. This ensures at most one active execution when FILTERED_IMPORT is on.
+        if (filteredImportPending != null) {
             return false;
         }
 
@@ -483,13 +527,18 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     private void onPushPatternSuccess(IPatternDetails pattern) {
         resetCraftingLock();
 
-        // Register the expected outputs of this execution for FILTERED_IMPORT (Option A).
-        // We keep ALL output types in the filter until the ENTIRE execution is complete so
-        // that a recipe returning multiple types (e.g. X and Y) does not lose its filter
-        // entry for X the moment X is received while Y is still pending.
-        var outputs = pattern.getOutputs();
-        if (outputs.length > 0) {
-            pendingPatternExecutions.add(new PendingPatternExecution(outputs));
+        // When FILTERED_IMPORT is enabled, populate filteredImportPending with this pattern's
+        // expected outputs. The map acts as both the return-inventory filter and a lock: the
+        // provider will not push another pattern until every expected output has come back.
+        if (configManager.getSetting(AAESettings.FILTERED_IMPORT) == YesNo.YES) {
+            var outputs = pattern.getOutputs();
+            if (outputs.length > 0) {
+                filteredImportPending = new HashMap<>();
+                for (var output : outputs) {
+                    filteredImportPending.merge(output.what(), output.amount(), Long::sum);
+                }
+                saveChanges();
+            }
         }
 
         var lockMode = configManager.getSetting(Settings.LOCK_CRAFTING_MODE);
@@ -722,6 +771,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         this.patternInventory.clear();
         this.sendList.clear();
         this.returnInv.clear();
+        this.filteredImportPending = null;
     }
 
     public PatternProviderReturnInventory getReturnInv() {
@@ -822,19 +872,16 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     }
 
     private void onStackReturnedToNetwork(GenericStack genericStack) {
-        // Notify the first pending execution that is still waiting for this output type.
-        // Once an execution is fully satisfied (all its output types have come back) it is
-        // removed, which in turn closes the filter for the types that belonged only to that
-        // execution.  Types shared with other still-running executions remain allowed because
-        // those executions are still present in the list.
-        var iter = pendingPatternExecutions.iterator();
-        while (iter.hasNext()) {
-            var execution = iter.next();
-            if (execution.onTypeReturned(genericStack.what())) {
-                if (execution.isComplete()) {
-                    iter.remove();
-                }
-                break;
+        // Decrement FILTERED_IMPORT pending outputs. When all expected outputs for the current
+        // execution have been received the map becomes empty and the provider is unlocked.
+        if (filteredImportPending != null) {
+            filteredImportPending.computeIfPresent(genericStack.what(), (k, remaining) -> {
+                var newRemaining = remaining - genericStack.amount();
+                return newRemaining > 0 ? newRemaining : null;
+            });
+            if (filteredImportPending.isEmpty()) {
+                filteredImportPending = null;
+                saveChanges();
             }
         }
 
@@ -862,22 +909,16 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     }
 
     /**
-     * Returns the set of {@link AEKey}s that are expected outputs of patterns currently being
-     * executed by this provider. Used by
+     * Returns the set of {@link AEKey}s that are expected outputs of the currently active
+     * pattern execution. Used by
      * {@link net.pedroksl.advanced_ae.common.inventory.AdvPatternProviderReturnInventory} to
-     * implement Option-A filtering semantics.
+     * filter which items may enter the return inventory when FILTERED_IMPORT is enabled.
      *
-     * <p>All output types belonging to an incomplete execution are kept in the set until
-     * <em>every</em> output type of that execution has been returned. This prevents a recipe
-     * that returns X and Y from losing its filter entry for X the moment X arrives while Y is
-     * still in transit.
+     * <p>Returns an empty set when no execution is in progress (filter opens up, so the provider
+     * behaves normally while idle).
      */
     public Set<AEKey> getActiveExpectedOutputs() {
-        Set<AEKey> result = new HashSet<>();
-        for (var execution : pendingPatternExecutions) {
-            result.addAll(execution.allOutputTypes);
-        }
-        return result;
+        return filteredImportPending != null ? filteredImportPending.keySet() : Set.of();
     }
 
     private class Ticker implements IGridTickable {
@@ -987,45 +1028,5 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
             redstoneState = be.getLevel().hasNeighborSignal(be.getBlockPos()) ? YesNo.YES : YesNo.NO;
         }
         return redstoneState == YesNo.YES;
-    }
-
-    /**
-     * Tracks the expected outputs of a single pushed pattern execution for FILTERED_IMPORT.
-     *
-     * <p>{@link #allOutputTypes} is fixed at construction time and drives the filter: the
-     * return-inventory filter keeps all output types of this execution open until the execution
-     * is {@link #isComplete() complete}. {@link #remaining} is decremented as items come back
-     * and is used to detect completion.
-     */
-    private static class PendingPatternExecution {
-        /** Full set of output types expected from this execution. Never modified after construction. */
-        final Set<AEKey> allOutputTypes;
-        /** Output types (with slot-level counts) that have not yet been returned to the network. */
-        final Map<AEKey, Integer> remaining;
-
-        PendingPatternExecution(GenericStack[] outputs) {
-            allOutputTypes = new HashSet<>();
-            remaining = new HashMap<>();
-            for (var output : outputs) {
-                allOutputTypes.add(output.what());
-                remaining.merge(output.what(), 1, Integer::sum);
-            }
-        }
-
-        /** Returns {@code true} once every expected output type has been received. */
-        boolean isComplete() {
-            return remaining.isEmpty();
-        }
-
-        /**
-         * Notify that one occurrence of {@code key} has been returned to the network.
-         *
-         * @return {@code true} if this execution was still waiting for {@code key}
-         */
-        boolean onTypeReturned(AEKey key) {
-            if (!remaining.containsKey(key)) return false;
-            remaining.computeIfPresent(key, (k, v) -> v <= 1 ? null : v - 1);
-            return true;
-        }
     }
 }
