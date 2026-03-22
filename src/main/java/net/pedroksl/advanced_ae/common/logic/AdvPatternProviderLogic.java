@@ -100,15 +100,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     private final PatternProviderReturnInventory returnInv;
 
     private final AdvPatternProviderTargetCache[] targetCaches = new AdvPatternProviderTargetCache[6];
-
-    /**
-     * Reference-count map of AEKeys that are expected outputs of patterns currently being executed
-     * by this provider. Populated when a pattern is pushed ({@link #onPushPatternSuccess}) and
-     * decremented when each output is returned to the network ({@link #onStackReturnedToNetwork}).
-     * Used by {@link net.pedroksl.advanced_ae.common.inventory.AdvPatternProviderReturnInventory}
-     * to implement Option-A semantics for {@link net.pedroksl.advanced_ae.api.AAESettings#FILTERED_IMPORT}.
-     */
-    private final HashMap<AEKey, Integer> activeExpectedOutputs = new HashMap<>();
+    private final HashSet<AEKey> outputCache = new HashSet<>();
 
     private YesNo redstoneState = YesNo.UNDECIDED;
 
@@ -304,6 +296,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     public void updatePatterns() {
         patterns.clear();
         patternInputs.clear();
+        outputCache.clear();
         if (craftingWatcher != null) {
             craftingWatcher.reset();
         }
@@ -318,6 +311,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
                 if (craftingWatcher != null) {
                     for (var output : details.getOutputs()) {
                         craftingWatcher.add(output.what());
+                        outputCache.add(output.what());
                     }
                 }
 
@@ -478,13 +472,6 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
 
     private void onPushPatternSuccess(IPatternDetails pattern) {
         resetCraftingLock();
-
-        // Register the expected outputs of this execution for FILTERED_IMPORT (Option A).
-        // Each push increments the reference count so concurrent executions of the same
-        // pattern are handled correctly.
-        for (var output : pattern.getOutputs()) {
-            activeExpectedOutputs.merge(output.what(), 1, Integer::sum);
-        }
 
         var lockMode = configManager.getSetting(Settings.LOCK_CRAFTING_MODE);
         switch (lockMode) {
@@ -816,11 +803,6 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     }
 
     private void onStackReturnedToNetwork(GenericStack genericStack) {
-        // Decrement the active-expected-outputs reference count for this key so that the
-        // FILTERED_IMPORT predicate stops accepting it once all crafts producing it have
-        // delivered their output.
-        activeExpectedOutputs.computeIfPresent(genericStack.what(), (k, v) -> v <= 1 ? null : v - 1);
-
         if (unlockEvent != UnlockCraftingEvent.RESULT) {
             return; // If we're not waiting for the result, we don't care
         }
@@ -844,14 +826,8 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         return trackedCrafts;
     }
 
-    /**
-     * Returns the set of {@link AEKey}s that are expected outputs of patterns currently being
-     * executed by this provider. Used by
-     * {@link net.pedroksl.advanced_ae.common.inventory.AdvPatternProviderReturnInventory} to
-     * implement Option-A filtering semantics.
-     */
-    public Set<AEKey> getActiveExpectedOutputs() {
-        return activeExpectedOutputs.keySet();
+    public HashSet<AEKey> getOutputCache() {
+        return outputCache;
     }
 
     private class Ticker implements IGridTickable {
