@@ -102,13 +102,17 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     private final AdvPatternProviderTargetCache[] targetCaches = new AdvPatternProviderTargetCache[6];
 
     /**
-     * Reference-count map of AEKeys that are expected outputs of patterns currently being executed
-     * by this provider. Populated when a pattern is pushed ({@link #onPushPatternSuccess}) and
-     * decremented when each output is returned to the network ({@link #onStackReturnedToNetwork}).
-     * Used by {@link net.pedroksl.advanced_ae.common.inventory.AdvPatternProviderReturnInventory}
-     * to implement Option-A semantics for {@link net.pedroksl.advanced_ae.api.AAESettings#FILTERED_IMPORT}.
+     * Per-execution tracking for FILTERED_IMPORT (Option A). Each entry represents one pushed
+     * pattern execution. An execution is removed only once <em>all</em> of its output types have
+     * been returned to the network, so the return-inventory filter keeps accepting every output type
+     * of an execution until the entire execution is complete – not just until the individual type is
+     * returned first.
+     *
+     * @see #onPushPatternSuccess
+     * @see #onStackReturnedToNetwork
+     * @see #getActiveExpectedOutputs
      */
-    private final HashMap<AEKey, Integer> activeExpectedOutputs = new HashMap<>();
+    private final List<PendingPatternExecution> pendingPatternExecutions = new ArrayList<>();
 
     private YesNo redstoneState = YesNo.UNDECIDED;
 
@@ -480,10 +484,12 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         resetCraftingLock();
 
         // Register the expected outputs of this execution for FILTERED_IMPORT (Option A).
-        // Each push increments the reference count so concurrent executions of the same
-        // pattern are handled correctly.
-        for (var output : pattern.getOutputs()) {
-            activeExpectedOutputs.merge(output.what(), 1, Integer::sum);
+        // We keep ALL output types in the filter until the ENTIRE execution is complete so
+        // that a recipe returning multiple types (e.g. X and Y) does not lose its filter
+        // entry for X the moment X is received while Y is still pending.
+        var outputs = pattern.getOutputs();
+        if (outputs.length > 0) {
+            pendingPatternExecutions.add(new PendingPatternExecution(outputs));
         }
 
         var lockMode = configManager.getSetting(Settings.LOCK_CRAFTING_MODE);
@@ -816,10 +822,21 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
     }
 
     private void onStackReturnedToNetwork(GenericStack genericStack) {
-        // Decrement the active-expected-outputs reference count for this key so that the
-        // FILTERED_IMPORT predicate stops accepting it once all crafts producing it have
-        // delivered their output.
-        activeExpectedOutputs.computeIfPresent(genericStack.what(), (k, v) -> v <= 1 ? null : v - 1);
+        // Notify the first pending execution that is still waiting for this output type.
+        // Once an execution is fully satisfied (all its output types have come back) it is
+        // removed, which in turn closes the filter for the types that belonged only to that
+        // execution.  Types shared with other still-running executions remain allowed because
+        // those executions are still present in the list.
+        var iter = pendingPatternExecutions.iterator();
+        while (iter.hasNext()) {
+            var execution = iter.next();
+            if (execution.onTypeReturned(genericStack.what())) {
+                if (execution.isComplete()) {
+                    iter.remove();
+                }
+                break;
+            }
+        }
 
         if (unlockEvent != UnlockCraftingEvent.RESULT) {
             return; // If we're not waiting for the result, we don't care
@@ -849,9 +866,18 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
      * executed by this provider. Used by
      * {@link net.pedroksl.advanced_ae.common.inventory.AdvPatternProviderReturnInventory} to
      * implement Option-A filtering semantics.
+     *
+     * <p>All output types belonging to an incomplete execution are kept in the set until
+     * <em>every</em> output type of that execution has been returned. This prevents a recipe
+     * that returns X and Y from losing its filter entry for X the moment X arrives while Y is
+     * still in transit.
      */
     public Set<AEKey> getActiveExpectedOutputs() {
-        return activeExpectedOutputs.keySet();
+        Set<AEKey> result = new HashSet<>();
+        for (var execution : pendingPatternExecutions) {
+            result.addAll(execution.allOutputTypes);
+        }
+        return result;
     }
 
     private class Ticker implements IGridTickable {
@@ -961,5 +987,45 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
             redstoneState = be.getLevel().hasNeighborSignal(be.getBlockPos()) ? YesNo.YES : YesNo.NO;
         }
         return redstoneState == YesNo.YES;
+    }
+
+    /**
+     * Tracks the expected outputs of a single pushed pattern execution for FILTERED_IMPORT.
+     *
+     * <p>{@link #allOutputTypes} is fixed at construction time and drives the filter: the
+     * return-inventory filter keeps all output types of this execution open until the execution
+     * is {@link #isComplete() complete}. {@link #remaining} is decremented as items come back
+     * and is used to detect completion.
+     */
+    private static class PendingPatternExecution {
+        /** Full set of output types expected from this execution. Never modified after construction. */
+        final Set<AEKey> allOutputTypes;
+        /** Output types (with slot-level counts) that have not yet been returned to the network. */
+        final Map<AEKey, Integer> remaining;
+
+        PendingPatternExecution(GenericStack[] outputs) {
+            allOutputTypes = new HashSet<>();
+            remaining = new HashMap<>();
+            for (var output : outputs) {
+                allOutputTypes.add(output.what());
+                remaining.merge(output.what(), 1, Integer::sum);
+            }
+        }
+
+        /** Returns {@code true} once every expected output type has been received. */
+        boolean isComplete() {
+            return remaining.isEmpty();
+        }
+
+        /**
+         * Notify that one occurrence of {@code key} has been returned to the network.
+         *
+         * @return {@code true} if this execution was still waiting for {@code key}
+         */
+        boolean onTypeReturned(AEKey key) {
+            if (!remaining.containsKey(key)) return false;
+            remaining.computeIfPresent(key, (k, v) -> v <= 1 ? null : v - 1);
+            return true;
+        }
     }
 }
