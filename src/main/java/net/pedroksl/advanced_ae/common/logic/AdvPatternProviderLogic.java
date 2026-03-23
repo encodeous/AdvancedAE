@@ -532,7 +532,7 @@ public class AdvPatternProviderLogic implements InternalInventoryHost, ICrafting
         // provider will not push another pattern until every expected output has come back.
         if (configManager.getSetting(AAESettings.FILTERED_IMPORT) == YesNo.YES) {
             var outputs = pattern.getOutputs();
-            if (outputs.length > 0) {
+            if (!outputs.isEmpty()) {
                 filteredImportPending = new HashMap<>();
                 for (var output : outputs) {
                     filteredImportPending.merge(output.what(), output.amount(), Long::sum);
